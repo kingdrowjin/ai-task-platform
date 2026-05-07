@@ -1,0 +1,78 @@
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      PORT: "4000"
+      NODE_ENV: development
+      MONGO_URI: mongodb://mongo:27017/aitasks
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      JWT_SECRET: ${JWT_SECRET:-dev-secret-change-me-in-prod}
+      CORS_ORIGIN: http://localhost:5173
+    ports:
+      - "4000:4000"
+
+  worker:
+    build:
+      context: ./worker
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      MONGO_URI: mongodb://mongo:27017/aitasks
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      QUEUE_KEY: tasks:queue
+      WORKER_ID: worker-local
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE: /api
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "5173:8080"
+
+volumes:
+  mongo-data:
+  redis-data:

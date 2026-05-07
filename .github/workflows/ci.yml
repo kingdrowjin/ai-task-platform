@@ -1,0 +1,141 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_OWNER: ${{ github.repository_owner }}
+  INFRA_REPO: ${{ github.repository_owner }}/ai-task-platform-infra
+
+jobs:
+  lint-backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm install --no-audit --no-fund
+      - run: npm run lint
+
+  lint-frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm install --no-audit --no-fund
+      - run: npm run lint
+
+  lint-worker:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: worker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff==0.4.4
+      - run: ruff check .
+
+  build-and-push:
+    runs-on: ubuntu-latest
+    needs: [lint-backend, lint-frontend, lint-worker]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        component:
+          - { name: backend,  context: backend  }
+          - { name: worker,   context: worker   }
+          - { name: frontend, context: frontend }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tag
+        id: tag
+        run: echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.component.context }}
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/ai-task-${{ matrix.component.name }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/ai-task-${{ matrix.component.name }}:${{ steps.tag.outputs.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  bump-infra:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Compute image tag
+        id: tag
+        run: echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout infra repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.INFRA_REPO }}
+          token: ${{ secrets.INFRA_REPO_TOKEN }}
+          path: infra
+
+      - name: Install kustomize
+        run: |
+          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+          sudo mv kustomize /usr/local/bin/
+
+      - name: Update production image tags
+        working-directory: infra/overlays/production
+        run: |
+          NEW_TAG="${{ steps.tag.outputs.sha }}"
+          OWNER="${{ env.IMAGE_OWNER }}"
+          kustomize edit set image \
+            REPLACE_REGISTRY/ai-task-backend=${{ env.REGISTRY }}/$OWNER/ai-task-backend:$NEW_TAG \
+            REPLACE_REGISTRY/ai-task-worker=${{ env.REGISTRY }}/$OWNER/ai-task-worker:$NEW_TAG \
+            REPLACE_REGISTRY/ai-task-frontend=${{ env.REGISTRY }}/$OWNER/ai-task-frontend:$NEW_TAG
+
+      - name: Commit and push
+        working-directory: infra
+        run: |
+          git config user.name  "ci-bot"
+          git config user.email "ci-bot@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "No infra changes — skipping commit"
+            exit 0
+          fi
+          git add overlays/production/kustomization.yaml
+          git commit -m "ci: bump production images to ${{ steps.tag.outputs.sha }}"
+          git push
